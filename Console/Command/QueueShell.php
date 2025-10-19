@@ -297,6 +297,14 @@ class QueueShell extends AppShell {
             return;
         }
 
+        // Check if running in ECS mode
+        $enableEcs = !empty($this->params['enable-ecs']);
+        if ($enableEcs) {
+            $this->out('[ECS MODE] Only processing messages with useEcsServer=true');
+        } else {
+            $this->out('[EC2 MODE] Only processing messages with useEcsServer=false or not set');
+        }
+
 
         if ($pidFilePath = Configure::read('Queue.pidfilepath')) {
             if (!file_exists($pidFilePath)) {
@@ -346,7 +354,7 @@ class QueueShell extends AppShell {
                 touch($pidFilePath . $pidFileName);
             }
             //$this->_log('runworker', isset($pid) ? $pid : null);
-            $this->out('[' . date('Y-m-d H:i:s') . '] Looking for Job ...');
+            $this->out('[' . date('Y-m-d H:i:s') . '] Looking for' . ($enableEcs ? 'ECS' : 'EC2') . ' Job ...');
 
             $data = $this->QueuedTask->requestSqsJob($queueUrl);
             //$data = $this->QueuedTask->requestJob($this->_getTaskConf(), $group);
@@ -374,12 +382,29 @@ class QueueShell extends AppShell {
                   }
                 }
                 if ($data) {
-                    $this->out('Running Job of type "' . $data['jobtype'] . '"');
                     $taskname = 'Queue' . $data['jobtype'];
-
                     if ($this->{$taskname}->autoUnserialize) {
                         $data['data'] = unserialize($data['data']);
                     }
+
+                    // Check if message is for this worker type
+                    $useEcsServer = isset($data['data']['useEcsServer']) ? $data['data']['useEcsServer'] : false;
+                    $isForThisWorker = ($enableEcs && $useEcsServer) || (!$enableEcs && !$useEcsServer);
+
+                    if (!$isForThisWorker) {
+                        // Not for us - release for the other worker type
+                        $targetWorker = $enableEcs ? 'EC2' : 'ECS';
+                        $this->out('[SKIP] Message is for ' . $targetWorker . ' worker - releasing');
+
+                        $this->QueuedTask->releaseSqsMessage($queueUrl, $data['sqsReceiptHandle'], 30);
+                        $this->QueuedTask->updateAll(
+                            ['fetched' => null, 'workerkey' => null],
+                            ['id' => $data['id']]
+                        );
+                        continue;
+                    }
+
+                    $this->out('Running Job of type "' . $data['jobtype'] . '"');
                     //prevent tasks that don't catch their own errors from killing this worker
 
                     try {
@@ -527,6 +552,16 @@ class QueueShell extends AppShell {
 			'default' => ''
 		];
 
+		$subcommandParserSqs = [
+			'options' => [
+				'enable-ecs' => [
+					'help' => 'Enable ECS mode - only process messages with useEcsServer=true',
+					'boolean' => true,
+					'default' => false
+				]
+			]
+		];
+
 		return parent::getOptionParser()
 			->description(__d('cake_console', "Simple and minimalistic job queue (or deferred-task) system."))
 			->addSubcommand('clean', [
@@ -548,6 +583,10 @@ class QueueShell extends AppShell {
 			->addSubcommand('runworker', [
 				'help' => 'Run Worker',
 				'parser' => $subcommandParserFull
+			])
+			->addSubcommand('runworkersqs', [
+				'help' => 'Run SQS Worker',
+				'parser' => $subcommandParserSqs
 			]);
 	}
 

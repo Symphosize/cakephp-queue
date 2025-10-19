@@ -87,6 +87,27 @@ class QueuedTask extends QueueAppModel {
 		return $this;
 	}
 
+  public function isCompanyForEcsQueue($bidId) {
+    $companyBid = ClassRegistry::init('CompanyBid')->find('first', [
+      'conditions' => [
+        'CompanyBid.id' => $bidId,
+      ],
+      'contain' => false,
+      'fields' => ['company_id']
+    ]);
+    if (empty($companyBid)) {
+      return false;
+    }
+    $companySetting = ClassRegistry::init('Symphosize.CompanySetting')->find('first', [
+      'conditions' => [
+        'CompanySetting.company_id' => $companyBid['CompanyBid']['company_id'],
+        'CompanySetting.slug' => 'ecs_queue_enabled',
+      ],
+      'contain' => false,
+    ]);
+    return !empty($companySetting['CompanySetting']['value']);
+  }
+
 /**
  * Add a new Job to the Queue.
  *
@@ -114,12 +135,14 @@ class QueuedTask extends QueueAppModel {
                 $dupeKey = $data['company_id'] . '.' . $data['sub_service_id'];
                 break;
             case 'SaveConnection':
-				$additionalKey = isset($data['isStatusChanged']) ? (int) $data['isStatusChanged'] : 0;
+                $additionalKey = isset($data['isStatusChanged']) ? (int) $data['isStatusChanged'] : 0;
                 $dupeKey = $data['bidId'] . '.' . $additionalKey;
+                $data['useEcsServer'] = $this->isCompanyForEcsQueue($data['bidId']);
                 break;
             case 'SaveSingleConnection':
-				$additionalKey = isset($data['isStatusChanged']) ? (int) $data['isStatusChanged'] : 0;
+                $additionalKey = isset($data['isStatusChanged']) ? (int) $data['isStatusChanged'] : 0;
                 $dupeKey = $data['provider'] . '.' . $data['bidId'] . '.' . $additionalKey;
+                $data['useEcsServer'] = $this->isCompanyForEcsQueue($data['bidId']);
                 break;
             case 'SyncIntercomCompany':
                 $dupeKey = $data['company_id'];
@@ -221,7 +244,7 @@ class QueuedTask extends QueueAppModel {
                 'MessageBody' => json_encode([
                     'id' => $taskId,
                     'retryCount' => $retryCount,
-                    'jobtype' => $jobName
+                    'jobtype' => $jobName,
                 ])
             ));
         } catch(Exception $e) {
@@ -357,6 +380,8 @@ class QueuedTask extends QueueAppModel {
         }
 
         $confirmRecord['QueuedTask']['sqsReceiptHandle'] = $message['ReceiptHandle'];
+        // Include useEcsServer flag from SQS message body for worker filtering
+        $confirmRecord['QueuedTask']['useEcsServer'] = isset($data['useEcsServer']) ? $data['useEcsServer'] : false;
 
         return $confirmRecord['QueuedTask'];
     }
@@ -403,6 +428,19 @@ class QueuedTask extends QueueAppModel {
             ]);
         } catch(\Exception $e) {
 
+        }
+    }
+
+    public function releaseSqsMessage($queueUrl, $receiptHandle, $visibilityTimeout = 30) {
+        try {
+            // Release message with delay to let the other worker type receive it
+            $this->sqsClient->changeMessageVisibility([
+                'QueueUrl' => $queueUrl,
+                'ReceiptHandle' => $receiptHandle,
+                'VisibilityTimeout' => $visibilityTimeout
+            ]);
+        } catch(\Exception $e) {
+            CakeLog::write('queue-error', 'Failed to release SQS message: ' . $e->getMessage());
         }
     }
 
