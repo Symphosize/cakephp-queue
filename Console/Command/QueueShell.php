@@ -406,33 +406,40 @@ class QueueShell extends AppShell {
                         $data['jobtype'] = preg_replace('/-ECS$/i', '', $data['jobtype']);
                     }
                     $taskname = 'Queue' . $data['jobtype'];
+                    $return = false;
+                    $errorMessage = null;
 
-                    if ($this->{$taskname}->autoUnserialize) {
-                        $data['data'] = unserialize($data['data']);
-                    }
-                    //prevent tasks that don't catch their own errors from killing this worker
+                    //a job type with no matching task would call run() on null and kill this worker
+                    if (!$this->hasTask($taskname)) {
+                        $errorMessage = 'No ' . $taskname . 'Task found for job type "' . $data['jobtype'] . '" (job ' . $data['id'] . ')';
+                        $this->_logError($errorMessage);
+                    } else {
+                        //prevent tasks that don't catch their own errors (or throw PHP Errors) from killing this worker
+                        try {
+                            if ($this->{$taskname}->autoUnserialize) {
+                                $data['data'] = unserialize($data['data']);
+                            }
+                            $return = $this->{$taskname}->run($data['data'], $data['id']);
+                        } catch (Throwable $e) {
+                            //assume job failed
+                            $return = false;
+                            $errorMessage = get_class($e) . ': ' . $e->getMessage();
 
-                    try {
-                        $return = $this->{$taskname}->run($data['data'], $data['id']);
-                    } catch ( Exception $e)
-                    {
-                        //assume job failed
-                        $return = false;
-
-                        //log the exception
-                        $this->_logError( $taskname ."\n\n". $e->getMessage() ."\n\n". $e->getTraceAsString() );
+                            //log the exception
+                            $this->_logError( $taskname . ' (job ' . $data['id'] . ")\n\n" . $errorMessage . "\n\n" . $e->getTraceAsString() );
+                        }
                     }
 
                     if ($return) {
                         $this->QueuedTask->markJobDoneSqs($data, $queueUrl);
                         $this->out('Job Finished.');
                     } else {
-                        $failureMessage = null;
-                        if (isset($this->{$taskname}->failureMessage) && !empty($this->{$taskname}->failureMessage)) {
+                        $failureMessage = $errorMessage;
+                        if ($this->hasTask($taskname) && !empty($this->{$taskname}->failureMessage)) {
                             $failureMessage = $this->{$taskname}->failureMessage;
                         }
                         $this->QueuedTask->markJobFailedSqs($data, $queueUrl, $failureMessage);
-                        $this->out('Job did not finish, requeued.');
+                        $this->out('Job did not finish, marked failed.');
                     }
                     $this->_messagesProcessed++;
                 } elseif (Configure::read('Queue.exitwhennothingtodo')) {
@@ -662,7 +669,8 @@ class QueueShell extends AppShell {
 	protected function _logError($message = '') {
 		# log?
 		if (Configure::read('Queue.log')) {
-			CakeLog::write('queue-error', $message);
+			//no log engine handles a 'queue-error' type, so these were silently dropped
+			CakeLog::write('error', 'Queue: ' . $message);
 		}
 	}
 
