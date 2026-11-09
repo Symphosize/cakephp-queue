@@ -13,7 +13,9 @@ class QueueShellTest extends CakeTestCase {
  * @var array
  */
 	public $fixtures = [
-		'plugin.queue.queued_task'
+		'plugin.queue.queued_task',
+		// QueuedTask reads its AWS keys from Symphosize.Setting when it is built; the app's fixture runs on MySQL 8.
+		'app.setting',
 	];
 
 	public function setUp() {
@@ -109,6 +111,86 @@ class QueueShellTest extends CakeTestCase {
 		$this->assertTrue(in_array('Job did not finish, requeued.', $this->QueueShell->out));
 	}
 
+/**
+ * A task that throws an Error, and a message for a task this image does not have,
+ * each fail their own job and the SQS worker moves on instead of exiting.
+ * A failureMessage left on a reused task by an earlier job never reaches a later job.
+ *
+ * @return void
+ */
+	public function testRunworkersqsFailsJobOnThrowableAndKeepsRunning() {
+		$this->QueueShell->QueueThrowsTypeError = new ThrowsTypeErrorTestTask();
+		$this->QueueShell->QueueReturnsFalse = new ReturnsFalseTestTask();
+		$throwing = ['id' => 1, 'jobtype' => 'ThrowsTypeError', 'data' => null, 'sqsReceiptHandle' => 'r1'];
+		$missing = ['id' => 2, 'jobtype' => 'NotInThisImage', 'data' => null, 'sqsReceiptHandle' => 'r2'];
+		$returnsFalse = ['id' => 3, 'jobtype' => 'ReturnsFalse', 'data' => null, 'sqsReceiptHandle' => 'r3'];
+
+		$QueuedTask = $this->getMock('QueuedTask', ['requestSqsJob', 'markJobFailedSqs', 'markJobDoneSqs', 'cleanOldJobs']);
+		$QueuedTask->expects($this->exactly(4))->method('requestSqsJob')->will($this->returnCallback(
+			function () use ($QueuedTask, $throwing, $missing, $returnsFalse) {
+				static $calls = 0;
+				$calls++;
+				if ($calls === 1) {
+					return $throwing;
+				}
+				if ($calls === 2) {
+					return $missing;
+				}
+				if ($calls === 3) {
+					return $returnsFalse;
+				}
+				$QueuedTask->exit = true;
+				return [];
+			}
+		));
+		$QueuedTask->expects($this->never())->method('markJobDoneSqs');
+		$failed = [];
+		$QueuedTask->expects($this->exactly(3))->method('markJobFailedSqs')->will($this->returnCallback(
+			function ($job, $queueUrl, $failureMessage) use (&$failed) {
+				$failed[] = [$job['id'], $queueUrl, $failureMessage];
+			}
+		));
+		$this->QueueShell->QueuedTask = $QueuedTask;
+		$this->QueueShell->args = ['queue-url'];
+
+		$this->QueueShell->runworkersqs();
+
+		$this->assertSame([1, 'queue-url'], array_slice($failed[0], 0, 2));
+		// The leftover failureMessage was cleared before run(), so the thrown error is stored.
+		$this->assertStringStartsWith('TypeError: ', $failed[0][2]);
+		$this->assertSame([2, 'queue-url'], array_slice($failed[1], 0, 2));
+		$this->assertNotEmpty($failed[1][2]);
+		$this->assertSame([3, 'queue-url', null], $failed[2]);
+		$this->assertSame(3, count(array_keys($this->QueueShell->out, 'Job failed.')));
+	}
+
+}
+
+class ThrowsTypeErrorTestTask {
+
+	public $autoUnserialize = false;
+
+	public $failureMessage = 'reason left over from an earlier job';
+
+	public function run($data, $id) {
+		$takesInt = function (int $value) {
+		};
+		$takesInt('not an int');
+		return true;
+	}
+
+}
+
+class ReturnsFalseTestTask {
+
+	public $autoUnserialize = false;
+
+	public $failureMessage = 'reason left over from an earlier job';
+
+	public function run($data, $id) {
+		return false;
+	}
+
 }
 
 class TestQueueShell extends QueueShell {
@@ -117,6 +199,9 @@ class TestQueueShell extends QueueShell {
 
 	public function out($message = null, $newlines = 1, $level = Shell::NORMAL) {
 		$this->out[] = $message;
+	}
+
+	public function hr($newlines = 0, $width = 63) {
 	}
 
 	protected function _getTaskConf() {
