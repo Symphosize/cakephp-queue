@@ -236,27 +236,31 @@ class QueueShell extends AppShell {
 				if ($data) {
 					$this->out('Running Job of type "' . $data['jobtype'] . '"');
 					$taskname = 'Queue' . $data['jobtype'];
+					$thrownMessage = null;
 
-					if ($this->{$taskname}->autoUnserialize) {
-						$data['data'] = unserialize($data['data']);
-					}
-					//prevent tasks that don't catch their own errors from killing this worker
+					// Catch Throwable, not just Exception: on PHP 7 a TypeError or a call on null is an Error,
+					// and an uncaught one kills the worker. The lookup is inside so a jobtype with no task fails too.
 					try {
+						// The task object is reused for every job this worker runs: clear the last job's reason.
+						$task = $this->{$taskname};
+						if (isset($task->failureMessage)) {
+							$task->failureMessage = '';
+						}
+						if ($this->{$taskname}->autoUnserialize) {
+							$data['data'] = unserialize($data['data']);
+						}
 						$return = $this->{$taskname}->run($data['data'], $data['id']);
-					} catch ( Exception $e)
-					{
-						//assume job failed
+					} catch (Throwable $e) {
 						$return = false;
-
-						//log the exception
-						$this->_logError( $taskname ."\n\n". $e->getMessage() ."\n\n". $e->getTraceAsString() );
+						$thrownMessage = get_class($e) . ': ' . $e->getMessage();
+						$this->_logError($taskname . "\n\n" . $thrownMessage . "\n\n" . $e->getTraceAsString());
 					}
 
 					if ($return) {
 						$this->QueuedTask->markJobDone($data['id']);
 						$this->out('Job Finished.');
 					} else {
-						$failureMessage = null;
+						$failureMessage = $thrownMessage;
 						if (isset($this->{$taskname}->failureMessage) && !empty($this->{$taskname}->failureMessage)) {
 							$failureMessage = $this->{$taskname}->failureMessage;
 						}
@@ -406,33 +410,38 @@ class QueueShell extends AppShell {
                         $data['jobtype'] = preg_replace('/-ECS$/i', '', $data['jobtype']);
                     }
                     $taskname = 'Queue' . $data['jobtype'];
+                    $thrownMessage = null;
 
-                    if ($this->{$taskname}->autoUnserialize) {
-                        $data['data'] = unserialize($data['data']);
-                    }
-                    //prevent tasks that don't catch their own errors from killing this worker
-
+                    // Catch Throwable, not just Exception: on PHP 7 a TypeError or a call on null is an Error,
+                    // and an uncaught one kills the worker, so SQS hands the message to the next worker and kills that too.
+                    // The lookup is inside so a jobtype with no task in this image fails too.
                     try {
+                        // The task object is reused for every job this worker runs: clear the last job's reason.
+                        $task = $this->{$taskname};
+                        if (isset($task->failureMessage)) {
+                            $task->failureMessage = '';
+                        }
+                        if ($this->{$taskname}->autoUnserialize) {
+                            $data['data'] = unserialize($data['data']);
+                        }
                         $return = $this->{$taskname}->run($data['data'], $data['id']);
-                    } catch ( Exception $e)
-                    {
-                        //assume job failed
+                    } catch (Throwable $e) {
                         $return = false;
-
-                        //log the exception
-                        $this->_logError( $taskname ."\n\n". $e->getMessage() ."\n\n". $e->getTraceAsString() );
+                        $thrownMessage = get_class($e) . ': ' . $e->getMessage();
+                        $this->_logError($taskname . "\n\n" . $thrownMessage . "\n\n" . $e->getTraceAsString());
                     }
 
                     if ($return) {
                         $this->QueuedTask->markJobDoneSqs($data, $queueUrl);
                         $this->out('Job Finished.');
                     } else {
-                        $failureMessage = null;
+                        $failureMessage = $thrownMessage;
                         if (isset($this->{$taskname}->failureMessage) && !empty($this->{$taskname}->failureMessage)) {
                             $failureMessage = $this->{$taskname}->failureMessage;
                         }
+                        // The SQS path deletes the message: a failed job is not run again.
                         $this->QueuedTask->markJobFailedSqs($data, $queueUrl, $failureMessage);
-                        $this->out('Job did not finish, requeued.');
+                        $this->out('Job failed.');
                     }
                     $this->_messagesProcessed++;
                 } elseif (Configure::read('Queue.exitwhennothingtodo')) {
